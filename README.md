@@ -18,7 +18,7 @@ products are read directly with netCDF4.
 | `sentinel3_source.py` | Reads a Sentinel-3 OLCI WFR product directory (Rrs, all bands, chlorophyll). |
 | `granules.py` | Searches and downloads PACE (NASA CMR) and Sentinel-3 (Copernicus Data Space). |
 | `grid_resample.py` | Nearest-neighbour resampling. One neighbour lookup per source, shared by all bands. |
-| `plot_colocated.py` | Map plots of the colocated file (band, RGB, chlorophyll), or of a native PACE or Sentinel-3 product. |
+| `plot_colocated.py` | Map plots of the colocated file (band, RGB, chlorophyll), or of a native PACE or Sentinel-3 product, with land and coastline layers. |
 | `download_operational.py` | Downloads operational PACE L2 (AOP, BGC, IOP) and Sentinel-3 OLCI L2 (WFR, LFR) products for a capture. |
 
 ## Setup
@@ -81,6 +81,10 @@ From the capture directory, or with a path to it:
 ```bash
 python colocate_capture.py <capture_dir> --level l1d
 python colocate_capture.py <capture_dir> --level l2a --method polymer
+
+# Regular grid bounded by a region, 1 km pixels, bilinear resampling
+python colocate_capture.py <capture_dir> --level l2a --method polymer \
+    --grid region --bbox 5.2 61.4 14.4 66.4 --res-m 1000 --resampling bilinear
 ```
 
 Options:
@@ -89,6 +93,10 @@ Options:
 |---|---|
 | `--level l1d` or `--level l2a` | HYPSO product level. Default `l1d`. |
 | `--method` | Required with `--level l2a`: `polymer`, `dps`, `ocsmart` or `acolite_l2r`. |
+| `--grid hypso` or `--grid region` | Target grid. `hypso` (default) is the HYPSO pixel grid. `region` is a regular stereographic grid bounded by `--bbox`. |
+| `--bbox LON_MIN LAT_MIN LON_MAX LAT_MAX` | Region for `--grid region`. Required with `--grid region`. |
+| `--res-m` | Pixel size in metres for `--grid region`. Default 300. |
+| `--resampling nearest` or `--resampling bilinear` | Resampling method, applied to every source including HYPSO. Default `nearest`. |
 | `--no-download` | Use only granules already in the capture directory. Nothing is searched for or downloaded. |
 
 ### What happens when you run it
@@ -103,8 +111,10 @@ If a granule is not found, the script prints a warning and continues without it.
 
 ## Output
 
-`<capture>/<capture>-colocated-<level>.nc`, where `<level>` is `l1d` or
-`l2a-<method>`. Dimensions are `lines` × `samples` (the HYPSO grid).
+`<capture>/<capture>-colocated-<level>-<grid>-<resampling>.nc`, where `<level>` is
+`l1d` or `l2a-<method>`, `<grid>` is `hypso` or `region<res>m`, and `<resampling>` is
+`nearest` or `bilinear`. Dimensions are `lines` × `samples` on the target grid.
+With `--grid hypso` and nearest resampling, the output is on the HYPSO pixel grid.
 
 | Variable | Dimensions | Contents |
 |---|---|---|
@@ -190,12 +200,13 @@ python plot_colocated.py <Sentinel-3 .SEN3 directory> --native --chl
 
 The band and chlorophyll panels share a colour scale, set by the 2nd to 98th
 percentile of valid pixels. RGB uses a separate 2 to 98 percent stretch for each
-channel. No-data pixels are grey. Maps use plain longitude and latitude axes with
-no coastlines, so no map data is downloaded.
+channel. No-data pixels are white. Land is grey and coastlines are drawn from the
+Natural Earth 10 m data in cartopy's local cache, so nothing is downloaded.
 
 ## Notes and limitations
 
-- The common grid is the HYPSO pixel grid. Every product is resampled onto it, and HYPSO bands are written unchanged.
+- The default common grid is the HYPSO pixel grid. HYPSO bands are then written unchanged. With `--grid region`, HYPSO is resampled like the other sources.
+- Bilinear on the HYPSO swath is an inverse-distance mean of the four nearest source pixels, because pyresample's bilinear needs a regular grid. Bilinear on a region grid is true bilinear interpolation. Where no bilinear neighbour is valid, the nearest-neighbour value is used.
 - The search uses only the capture's own time and location. A granule is taken only if it lies within the time window. If nothing is in the window, nothing is used.
 - Automatic download has not been tested end to end yet. Local-granule runs have been tested on `image64N9E_2025-05-11T12-00-37Z`. Search has been tested against the live PACE and Copernicus catalogues.
 - Sentinel-3 quality flags (`wqsf`) are not applied. PACE `l2_flags` are not applied either.

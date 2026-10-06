@@ -31,6 +31,7 @@ import xarray as xr
 
 import granules
 import grid_resample
+from pyresample import geometry
 import hypso_source
 import pace_source
 import sentinel3_source
@@ -83,27 +84,52 @@ def _valid_fraction(array: np.ndarray) -> float:
     return float(np.isfinite(array).any(axis=-1).mean()) if array.ndim == 3 else float(np.isfinite(array).mean())
 
 
-def run(capture_dir: Path, download: bool = True, level: str = "l1d", method: str | None = None) -> Path:
+HYPSO_RADIUS_M = 300.0
+
+
+def run(capture_dir: Path, download: bool = True, level: str = "l1d", method: str | None = None,
+        grid: str = "hypso", bbox=None, res_m: float = 300.0, resample_method: str = "nearest") -> Path:
     capture_dir = Path(capture_dir).resolve()
     capture = hypso_source.read_hypso(capture_dir, level=level, method=method)
     product = f"{level}" if level == "l1d" else f"{level}-{method}"
     print(f"{capture.name}: HYPSO {product}, {capture.rhot.shape[-1]} bands, "
           f"grid {capture.latitude.shape}, time {capture.time}")
 
-    lats, lons = capture.latitude, capture.longitude
+    if grid == "hypso":
+        target = geometry.SwathDefinition(lons=capture.longitude, lats=capture.latitude)
+        lats, lons = capture.latitude, capture.longitude
+        grid_tag = "hypso"
+    elif grid == "region":
+        if bbox is None:
+            raise ValueError("grid=region needs a bbox (lon_min, lat_min, lon_max, lat_max)")
+        target = grid_resample.region_grid(tuple(bbox), res_m)
+        lons, lats = target.get_lonlats()
+        grid_tag = f"region{res_m:g}m"
+    else:
+        raise ValueError(f"grid must be 'hypso' or 'region', got {grid!r}")
+    print(f"target grid: {grid} {target.shape}, resampling: {resample_method}")
+
+    def resample(src_lon, src_lat, data, radius):
+        # On a region grid a target pixel is res_m wide, so the search radius must cover at least one pixel.
+        if grid == "region":
+            radius = max(radius, res_m)
+        return grid_resample.resample(src_lon, src_lat, data, target, radius, resample_method)
+
     out: dict[str, np.ndarray] = {}
     coords: dict[str, np.ndarray] = {}
 
-    # HYPSO itself is the target grid, so it is written unchanged.
-    out["hypso_bands"] = capture.rhot
+    # HYPSO: on its own pixel grid it is written unchanged; otherwise it is resampled too.
+    if grid == "hypso":
+        out["hypso_bands"] = capture.rhot
+    else:
+        out["hypso_bands"] = resample(capture.longitude, capture.latitude, capture.rhot, HYPSO_RADIUS_M)
     coords["hypso_wavelength"] = capture.wavelengths
 
     # PACE
     aop_path, bgc_path = _ensure_pace(capture_dir, capture, download)
     if aop_path is not None:
         swath = pace_source.read_l2_aop_swath(aop_path)
-        out["pace_rrs"] = grid_resample.resample_nearest(
-            swath.longitude, swath.latitude, swath.rrs, lons, lats, PACE_RADIUS_M)
+        out["pace_rrs"] = resample(swath.longitude, swath.latitude, swath.rrs, PACE_RADIUS_M)
         coords["pace_wavelength"] = np.asarray(swath.rrs_wavelengths)
         print(f"PACE AOP: {swath.rrs.shape[-1]} bands, valid on HYPSO grid "
               f"{_valid_fraction(out['pace_rrs']):.1%}")
@@ -111,21 +137,17 @@ def run(capture_dir: Path, download: bool = True, level: str = "l1d", method: st
         print("PACE AOP: not available for this capture")
     if bgc_path is not None:
         bgc = pace_source.read_l2_bgc_swath(bgc_path)
-        out["pace_chlor_a"] = grid_resample.resample_nearest(
-            bgc.longitude, bgc.latitude, bgc.chlor_a, lons, lats, PACE_RADIUS_M)
+        out["pace_chlor_a"] = resample(bgc.longitude, bgc.latitude, bgc.chlor_a, PACE_RADIUS_M)
         print(f"PACE BGC chlor_a valid on HYPSO grid {_valid_fraction(out['pace_chlor_a']):.1%}")
 
     # Sentinel-3
     s3_dir = _ensure_s3(capture_dir, capture, download)
     if s3_dir is not None:
         s3 = sentinel3_source.read_wfr_swath(s3_dir)
-        out["s3_rrs"] = grid_resample.resample_nearest(
-            s3.longitude, s3.latitude, s3.rrs, lons, lats, S3_RADIUS_M)
+        out["s3_rrs"] = resample(s3.longitude, s3.latitude, s3.rrs, S3_RADIUS_M)
         coords["s3_wavelength"] = np.asarray(s3.rrs_wavelengths)
-        out["s3_chl_oc4me"] = grid_resample.resample_nearest(
-            s3.longitude, s3.latitude, s3.chl_oc4me, lons, lats, S3_RADIUS_M)
-        out["s3_chl_nn"] = grid_resample.resample_nearest(
-            s3.longitude, s3.latitude, s3.chl_nn, lons, lats, S3_RADIUS_M)
+        out["s3_chl_oc4me"] = resample(s3.longitude, s3.latitude, s3.chl_oc4me, S3_RADIUS_M)
+        out["s3_chl_nn"] = resample(s3.longitude, s3.latitude, s3.chl_nn, S3_RADIUS_M)
         print(f"Sentinel-3: {s3.rrs.shape[-1]} bands, valid on HYPSO grid "
               f"{_valid_fraction(out['s3_rrs']):.1%}")
     else:
@@ -150,9 +172,9 @@ def run(capture_dir: Path, download: bool = True, level: str = "l1d", method: st
             **{k: (k, v) for k, v in coords.items()},
         },
         attrs={"hypso_capture": capture.name, "hypso_product": product, "time": str(capture.time),
-               "grid": "HYPSO-2 pixel grid, nearest-neighbour resampling"},
+               "grid": grid_tag, "resampling": resample_method},
     )
-    output = capture_dir / f"{capture.name}-colocated-{product}.nc"
+    output = capture_dir / f"{capture.name}-colocated-{product}-{grid_tag}-{resample_method}.nc"
     ds.to_netcdf(output)
     print(f"wrote {output}")
     return output
@@ -164,8 +186,17 @@ if __name__ == "__main__":
     parser.add_argument("--level", choices=["l1d", "l2a"], default="l1d", help="HYPSO product level")
     parser.add_argument("--method", choices=["polymer", "dps", "ocsmart", "acolite_l2r"],
                         help="L2A method (required with --level l2a)")
+    parser.add_argument("--grid", choices=["hypso", "region"], default="hypso",
+                        help="target grid: the HYPSO pixel grid, or a regular grid bounded by --bbox")
+    parser.add_argument("--bbox", type=float, nargs=4, metavar=("LON_MIN", "LAT_MIN", "LON_MAX", "LAT_MAX"),
+                        help="region for --grid region")
+    parser.add_argument("--res-m", type=float, default=300.0, help="pixel size in metres for --grid region")
+    parser.add_argument("--resampling", choices=["nearest", "bilinear"], default="nearest")
     parser.add_argument("--no-download", action="store_true", help="use local granules only")
     args = parser.parse_args()
+    if args.grid == "region" and args.bbox is None:
+        parser.error("--grid region needs --bbox")
     if args.level == "l2a" and args.method is None:
         parser.error("--level l2a needs --method")
-    run(args.capture_dir, download=not args.no_download, level=args.level, method=args.method)
+    run(args.capture_dir, download=not args.no_download, level=args.level, method=args.method,
+        grid=args.grid, bbox=args.bbox, res_m=args.res_m, resample_method=args.resampling)

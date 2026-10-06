@@ -52,8 +52,63 @@ def _shared_limits(arrays: list[np.ndarray]) -> tuple[float, float]:
     return tuple(np.percentile(finite, [2, 98]))
 
 
+_BASEMAP_CACHE: dict = {}
+
+
+def _clipped(category: str, name: str, extent):
+    """Natural Earth 10 m geometries inside extent = (lon_min, lon_max, lat_min, lat_max).
+    Data come from cartopy's local cache (no download)."""
+    import cartopy.io.shapereader as shpreader
+    from shapely.geometry import box
+    key = (category, name)
+    if key not in _BASEMAP_CACHE:
+        path = shpreader.natural_earth(resolution="10m", category=category, name=name)
+        _BASEMAP_CACHE[key] = list(shpreader.Reader(path).geometries())
+    window = box(*extent)
+    clipped = []
+    for geom in _BASEMAP_CACHE[key]:
+        if geom.intersects(window):
+            clipped.append(geom.intersection(window))
+    return clipped
+
+
+def basemap(ax, lon, lat, land=True, coast=True, ocean=False):
+    """Draw land fill and coastlines over the axes' current data extent.
+
+    land    grey land polygons (Natural Earth 10 m land)
+    coast   black coastline (Natural Earth 10 m coastline)
+    ocean   light blue ocean fill, drawn under the data (off by default)
+    """
+    from matplotlib.collections import LineCollection, PatchCollection
+    from matplotlib.patches import Polygon
+    extent = (float(np.nanmin(lon)), float(np.nanmax(lon)), float(np.nanmin(lat)), float(np.nanmax(lat)))
+    if ocean:
+        ax.add_patch(Polygon([(extent[0], extent[2]), (extent[1], extent[2]),
+                              (extent[1], extent[3]), (extent[0], extent[3])],
+                             closed=True, facecolor="#dbe9f6", edgecolor="none", zorder=0))
+    if land:
+        patches = []
+        for geom in _clipped("physical", "land", extent):
+            polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+            for poly in polys:
+                if poly.is_empty or poly.geom_type != "Polygon":
+                    continue
+                patches.append(Polygon(np.asarray(poly.exterior.coords), closed=True))
+                patches.extend(Polygon(np.asarray(r.coords), closed=True) for r in poly.interiors)
+        ax.add_collection(PatchCollection(patches, facecolor="0.55", edgecolor="none", zorder=3))
+    if coast:
+        lines = []
+        for geom in _clipped("physical", "coastline", extent):
+            parts = geom.geoms if hasattr(geom, "geoms") else [geom]
+            lines.extend(np.asarray(part.coords) for part in parts if not part.is_empty)
+        ax.add_collection(LineCollection(lines, colors="black", linewidths=0.4, zorder=4))
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+
+
 def _panel(ax, lon, lat, z, title, cmap, vmin, vmax, norm=None):
     mesh = ax.pcolormesh(lon, lat, z, cmap=cmap, vmin=vmin, vmax=vmax, norm=norm, shading="auto")
+    basemap(ax, lon, lat)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("longitude")
     ax.set_ylabel("latitude")
@@ -87,9 +142,10 @@ def plot_colocated(path: Path, mode: str, band: float | None, out: Path) -> Path
         fig, axes = plt.subplots(1, len(sources), figsize=(5.2 * len(sources), 5), squeeze=False)
         for ax, (name, cube, wl) in zip(axes[0], sources):
             img = _rgb_image(cube, wl)
-            ax.set_facecolor("0.85")
+            ax.set_facecolor("white")
             ax.imshow(img, extent=[np.nanmin(lon), np.nanmax(lon), np.nanmin(lat), np.nanmax(lat)],
                       origin="upper", aspect="auto", interpolation="nearest")
+            basemap(ax, lon, lat)
             ax.set_title(f"{name}\nR {RGB_BANDS[0]:.0f} G {RGB_BANDS[1]:.0f} B {RGB_BANDS[2]:.0f} nm", fontsize=10)
             ax.set_xlabel("longitude")
             ax.set_ylabel("latitude")
